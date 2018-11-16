@@ -1972,7 +1972,7 @@ func (c *client) addSubToRouteTargets(sub *subscription) {
 		c.in.rts = make([]routeTarget, 0, routeTargetInit)
 	}
 
-	for i, _ := range c.in.rts {
+	for i := range c.in.rts {
 		rt := &c.in.rts[i]
 		if rt.sub.client == sub.client {
 			if sub.queue != nil {
@@ -2135,7 +2135,7 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject,
 
 	// We address by index to avoimd struct copy. We have inline structs for memory
 	// layout and cache coherency.
-	for i, _ := range c.in.rts {
+	for i := range c.in.rts {
 		rt := &c.in.rts[i]
 
 		mh := c.msgb[:msgHeadProtoLen]

@@ -36,6 +36,7 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/nats-io/gnatsd/logger"
+	"github.com/nats-io/nkeys"
 )
 
 // Time to wait before starting closing clients when in LD mode.
@@ -142,6 +143,9 @@ type Server struct {
 	// LameDuck mode
 	ldm   bool
 	ldmCh chan bool
+
+	// Trusted public operator keys.
+	trustedNkeys []string
 }
 
 // Make sure all are 64bits for atomic use
@@ -184,6 +188,11 @@ func New(opts *Options) *Server {
 		done:       make(chan bool, 1),
 		start:      now,
 		configTime: now,
+	}
+
+	// ProcessTrustedNkeys
+	if !s.processTrustedNkeys() {
+		return nil
 	}
 
 	s.mu.Lock()
@@ -264,6 +273,55 @@ func (s *Server) generateRouteInfoJSON() {
 	b, _ := json.Marshal(s.routeInfo)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
 	s.routeInfoJSON = bytes.Join(pcs, []byte(" "))
+}
+
+// processTrustedNkeys will process stamped and option based
+// trusted nkeys. Returns success.
+func (s *Server) processTrustedNkeys() bool {
+	if trustedNkeys != "" && !s.initStampedTrustedNkeys() {
+		return false
+	} else if s.opts.TrustedNkeys != nil {
+		for _, key := range s.opts.TrustedNkeys {
+			if !nkeys.IsValidPublicOperatorKey(key) {
+				return false
+			}
+			s.trustedNkeys = s.opts.TrustedNkeys
+		}
+	}
+	return true
+}
+
+// checkTrustedNkeyString will check that the string is a valid array
+// of public operator nkeys.
+func checkTrustedNkeyString(keys string) []string {
+	tks := strings.Fields(keys)
+	if len(tks) == 0 {
+		return nil
+	}
+	// Walk all the keys and make sure they are valid.
+	for _, key := range tks {
+		if !nkeys.IsValidPublicOperatorKey(key) {
+			return nil
+		}
+	}
+	return tks
+}
+
+// initStampedTrustedNkeys will check the stamped trusted keys
+// and will set the server field 'trustedNkeys'. Returns whether
+// it succeeded or not.
+func (s *Server) initStampedTrustedNkeys() bool {
+	tks := checkTrustedNkeyString(trustedNkeys)
+	if len(tks) == 0 {
+		return false
+	}
+	// Check to see if we have an override in options, which will
+	// cause us to fail also.
+	if len(s.opts.TrustedNkeys) > 0 {
+		return false
+	}
+	s.trustedNkeys = tks
+	return true
 }
 
 // PrintAndDie is exported for access in other packages.
