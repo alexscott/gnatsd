@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nats-io/jwt"
 )
 
 // For backwards compatibility, users who are not explicitly defined into an
@@ -36,6 +38,7 @@ type rme struct {
 type Account struct {
 	Name     string
 	Nkey     string
+	Issuer   string
 	mu       sync.RWMutex
 	sl       *Sublist
 	clients  int
@@ -430,4 +433,64 @@ func (a *Account) checkServiceImportAuthorized(account *Account, subject string)
 	// Check that we allow this account.
 	_, ok = am[account.Name]
 	return ok
+}
+
+// AccountResolver interface. This is to fetch Account JWTs by public nkeys
+type AccountResolver interface {
+	Fetch(pub string) (*jwt.AccountClaims, error)
+}
+
+// Mostly for testing.
+type memAccResolver struct {
+	sync.Map
+}
+
+func (m *memAccResolver) Fetch(pub string) (*jwt.AccountClaims, error) {
+	if j, ok := m.Load(pub); ok {
+		if acc, err := jwt.DecodeAccountClaims(j.(string)); err != nil {
+			return nil, err
+		} else {
+			vr := jwt.CreateValidationResults()
+			acc.Validate(vr)
+			if vr.IsBlocking(true) {
+				return nil, ErrAccountValidation
+			}
+			return acc, nil
+		}
+	}
+	return nil, ErrMissingAccount
+}
+
+// Helper to build an internal account structure from a jwt.AccountClaims.
+func buildInternalAccount(ac *jwt.AccountClaims) *Account {
+	acc := &Account{Name: ac.Subject, Issuer: ac.Issuer}
+	// FIXME(dlc) - Imports and Exports, Limits etc..
+	return acc
+}
+
+// Helper to build internal NKeyUser.
+func buildInternalNkeyUser(uc *jwt.UserClaims, acc *Account) *NkeyUser {
+	nu := &NkeyUser{Nkey: uc.Subject, Account: acc}
+
+	// Now check for permissions.
+	var p *Permissions
+
+	if len(uc.Pub.Allow) > 0 || len(uc.Pub.Deny) > 0 {
+		if p == nil {
+			p = &Permissions{}
+		}
+		p.Publish = &SubjectPermission{}
+		p.Publish.Allow = uc.Pub.Allow
+		p.Publish.Deny = uc.Pub.Deny
+	}
+	if len(uc.Sub.Allow) > 0 || len(uc.Sub.Deny) > 0 {
+		if p == nil {
+			p = &Permissions{}
+		}
+		p.Subscribe = &SubjectPermission{}
+		p.Subscribe.Allow = uc.Sub.Allow
+		p.Subscribe.Deny = uc.Sub.Deny
+	}
+	nu.Permissions = p
+	return nu
 }

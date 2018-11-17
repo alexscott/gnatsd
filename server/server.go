@@ -85,6 +85,7 @@ type Server struct {
 	gacc           *Account
 	accounts       map[string]*Account
 	activeAccounts int
+	accResolver    AccountResolver
 	clients        map[uint64]*client
 	routes         map[uint64]*client
 	remotes        map[string]*client
@@ -275,6 +276,19 @@ func (s *Server) generateRouteInfoJSON() {
 	s.routeInfoJSON = bytes.Join(pcs, []byte(" "))
 }
 
+// isTrustedIssuer will check that the issuer is a trusted public key.
+// This is used to make sure and account was signed by a trusted operator.
+func (s *Server) isTrustedIssuer(issuer string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, tk := range s.trustedNkeys {
+		if tk == issuer {
+			return true
+		}
+	}
+	return false
+}
+
 // processTrustedNkeys will process stamped and option based
 // trusted nkeys. Returns success.
 func (s *Server) processTrustedNkeys() bool {
@@ -282,7 +296,7 @@ func (s *Server) processTrustedNkeys() bool {
 		return false
 	} else if s.opts.TrustedNkeys != nil {
 		for _, key := range s.opts.TrustedNkeys {
-			if !nkeys.IsValidPublicOperatorKey(key) {
+			if !nkeys.IsValidPublicOperatorKey([]byte(key)) {
 				return false
 			}
 			s.trustedNkeys = s.opts.TrustedNkeys
@@ -300,7 +314,7 @@ func checkTrustedNkeyString(keys string) []string {
 	}
 	// Walk all the keys and make sure they are valid.
 	for _, key := range tks {
-		if !nkeys.IsValidPublicOperatorKey(key) {
+		if !nkeys.IsValidPublicOperatorKey([]byte(key)) {
 			return nil
 		}
 	}
@@ -444,8 +458,28 @@ func (s *Server) registerAccount(acc *Account) {
 // associated with name.
 func (s *Server) LookupAccount(name string) *Account {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.accounts[name]
+	acc := s.accounts[name]
+	accResolver := s.accResolver
+	s.mu.Unlock()
+	if acc != nil {
+		return acc
+	}
+	// If we have a resolver see if it can fetch the account. We need to
+	// do this without the lock
+	if accResolver != nil {
+		fmt.Printf("TRying to Fetch! %q\n\n", name)
+		if accClaims, err := accResolver.Fetch(name); err == nil {
+			fmt.Printf("accClaims is %+v\n", accClaims)
+			if acc := buildInternalAccount(accClaims); acc != nil {
+				s.mu.Lock()
+				s.registerAccount(acc)
+				s.mu.Unlock()
+				return acc
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 // Start up the server, this will block.

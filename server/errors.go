@@ -65,6 +65,9 @@ var (
 	// ErrMissingAccount is returned when an account does not exist.
 	ErrMissingAccount = errors.New("Account Missing")
 
+	// ErrAccountValidation is returned when an account has failed validation.
+	ErrAccountValidation = errors.New("Account Validation Failed")
+
 	// ErrStreamImportAuthorization is returned when a stream import is not authorized.
 	ErrStreamImportAuthorization = errors.New("Stream Import Not Authorized")
 

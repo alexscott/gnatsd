@@ -289,6 +289,7 @@ type clientOpts struct {
 	Pedantic      bool   `json:"pedantic"`
 	TLSRequired   bool   `json:"tls_required"`
 	Nkey          string `json:"nkey,omitempty"`
+	JWT           string `json:"jwt,omitempty"`
 	Sig           string `json:"sig,omitempty"`
 	Authorization string `json:"auth_token,omitempty"`
 	Username      string `json:"user,omitempty"`
@@ -985,14 +986,21 @@ func (c *client) authTimeout() {
 }
 
 func (c *client) authViolation() {
-	var hasNkeys, hasUsers bool
+	var hasTrustedNkeys, hasNkeys, hasUsers bool
 	if s := c.srv; s != nil {
 		s.mu.Lock()
+		hasTrustedNkeys = len(s.trustedNkeys) > 0
 		hasNkeys = s.nkeys != nil
 		hasUsers = s.users != nil
 		s.mu.Unlock()
 	}
-	if hasNkeys {
+	if hasTrustedNkeys {
+		if c.opts.JWT != "" {
+			c.Errorf("%s - User JWT Invalid", ErrAuthorization.Error())
+		} else {
+			c.Errorf("%s - User JWT Missing", ErrAuthorization.Error())
+		}
+	} else if hasNkeys {
 		c.Errorf("%s - Nkey %q",
 			ErrAuthorization.Error(),
 			c.opts.Nkey)

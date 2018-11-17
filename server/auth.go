@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"strings"
 
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -181,6 +182,8 @@ func (s *Server) configureAuthorization() {
 	// This just checks and sets up the user map if we have multiple users.
 	if opts.CustomClientAuthentication != nil {
 		s.info.AuthRequired = true
+	} else if len(s.trustedNkeys) > 0 {
+		s.info.AuthRequired = true
 	} else if opts.Nkeys != nil || opts.Users != nil {
 		// Support both at the same time.
 		if opts.Nkeys != nil {
@@ -229,14 +232,19 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	password := s.opts.Password
 	s.optsMu.RUnlock()
 
-	// Check custom auth first, then nkeys, then multiple users, then token, then single user/pass.
+	// Check custom auth first, then jwts, then nkeys, then multiple users, then token, then single user/pass.
 	if customClientAuthentication != nil {
 		return customClientAuthentication.Check(c)
 	}
 
-	var nkey *NkeyUser
-	var user *User
-	var ok bool
+	var (
+		nkey *NkeyUser
+		juc  *jwt.UserClaims
+		acc  *Account
+		user *User
+		ok   bool
+		err  error
+	)
 
 	s.mu.Lock()
 	authRequired := s.info.AuthRequired
@@ -244,6 +252,27 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		// TODO(dlc) - If they send us credentials should we fail?
 		s.mu.Unlock()
 		return true
+	}
+
+	// Check if we have trustedNkeys defined in the server. If so we require a user jwt.
+	if s.trustedNkeys != nil {
+		if c.opts.JWT == "" {
+			s.mu.Unlock()
+			return false
+		}
+		// So we have a valid user jwt here.
+		juc, err = jwt.DecodeUserClaims(c.opts.JWT)
+		if err != nil {
+			// Should we debug log here?
+			s.mu.Unlock()
+			return false
+		}
+		vr := jwt.CreateValidationResults()
+		juc.Validate(vr)
+		if vr.IsBlocking(true) {
+			s.mu.Unlock()
+			return false
+		}
 	}
 
 	// Check if we have nkeys or users for client.
@@ -264,7 +293,38 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	}
 	s.mu.Unlock()
 
+	// If we have a jwt and a userClaim, make sure we have the Account, etc associated.
+	// We need to look up the account. This will use a resolver if one is present.
+	if juc != nil {
+		if acc = s.LookupAccount(juc.Issuer); acc == nil {
+			return false
+		}
+		if !s.isTrustedIssuer(acc.Issuer) {
+			return false
+		}
+	}
+
 	// Verify the signature against the nonce.
+	if juc != nil {
+		if c.opts.Sig == "" {
+			return false
+		}
+		sig, err := base64.StdEncoding.DecodeString(c.opts.Sig)
+		if err != nil {
+			return false
+		}
+		pub, err := nkeys.FromPublicKey([]byte(juc.Subject))
+		if err != nil {
+			return false
+		}
+		if err := pub.Verify(c.nonce, sig); err != nil {
+			return false
+		}
+		nkey = buildInternalNkeyUser(juc, acc)
+		c.RegisterNkeyUser(nkey)
+		return true
+	}
+
 	if nkey != nil {
 		if c.opts.Sig == "" {
 			return false
@@ -273,7 +333,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		if err != nil {
 			return false
 		}
-		pub, err := nkeys.FromPublicKey(c.opts.Nkey)
+		pub, err := nkeys.FromPublicKey([]byte(c.opts.Nkey))
 		if err != nil {
 			return false
 		}

@@ -1135,7 +1135,7 @@ func TestAccountMapsUsers(t *testing.T) {
 	}
 
 	// Now test nkeys as well.
-	kp, _ := nkeys.FromSeed(seed1)
+	kp, _ := nkeys.FromSeed([]byte(seed1))
 	pubKey, _ := kp.PublicKey()
 
 	c, cr, l := newClientForServer(s)
@@ -1166,7 +1166,7 @@ func TestAccountMapsUsers(t *testing.T) {
 	}
 
 	// Now nats account nkey user.
-	kp, _ = nkeys.FromSeed(seed2)
+	kp, _ = nkeys.FromSeed([]byte(seed2))
 	pubKey, _ = kp.PublicKey()
 
 	c, cr, l = newClientForServer(s)
