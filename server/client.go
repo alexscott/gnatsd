@@ -26,6 +26,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nats-io/jwt"
 )
 
 // Type of client connection.
@@ -128,6 +130,7 @@ const (
 	DuplicateRoute
 	RouteRemoved
 	ServerShutdown
+	AuthenticationExpired
 )
 
 type client struct {
@@ -365,16 +368,12 @@ func (c *client) registerWithAccount(acc *Account) error {
 	// If we were previously register, usually to $G, do accounting here to remove.
 	if c.acc != nil {
 		if prev := c.acc.removeClient(c); prev == 1 && c.srv != nil {
-			c.srv.mu.Lock()
-			c.srv.activeAccounts--
-			c.srv.mu.Unlock()
+			c.srv.decActiveAccounts()
 		}
 	}
 	// Add in new one.
 	if prev := acc.addClient(c); prev == 0 && c.srv != nil {
-		c.srv.mu.Lock()
-		c.srv.activeAccounts++
-		c.srv.mu.Unlock()
+		c.srv.incActiveAccounts()
 	}
 	c.mu.Lock()
 	c.acc = acc
@@ -413,13 +412,17 @@ func (c *client) RegisterUser(user *User) {
 // client with the authenticated user. This is used to map
 // any permissions into the client and setup accounts.
 func (c *client) RegisterNkeyUser(user *NkeyUser) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Register with proper account and sublist.
 	if user.Account != nil {
-		c.acc = user.Account
+		if err := c.registerWithAccount(user.Account); err != nil {
+			c.Errorf("Problem registering with account [%s]", user.Account.Name)
+			c.sendErr("Failed Account Registration")
+			return
+		}
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Assign permissions.
 	if user.Permissions == nil {
@@ -478,6 +481,20 @@ func (c *client) setPermissions(perms *Permissions) {
 			c.perms.sub.deny.Insert(sub)
 		}
 	}
+}
+
+// Check to see if we have an expiration for the user JWT via base claims.
+// FIXME(dlc) - Clear on connect with new JWT.
+func (c *client) checkExpiration(claims *jwt.ClaimsData) {
+	if claims.Expires == 0 {
+		return
+	}
+	tn := time.Now().Unix()
+	if claims.Expires < tn {
+		return
+	}
+	expiresAt := time.Duration(claims.Expires - tn)
+	c.setExpirationTimer(expiresAt * time.Second)
 }
 
 // This will load up the deny structure used for filtering delivered
@@ -560,7 +577,7 @@ func (c *client) readLoop() {
 		// to process messages, etc.
 		if err := c.parse(b[:n]); err != nil {
 			// handled inline
-			if err != ErrMaxPayload && err != ErrAuthorization {
+			if err != ErrMaxPayload && err != ErrAuthentication {
 				c.Errorf("%s", err.Error())
 				c.closeConnection(ProtocolViolation)
 			}
@@ -906,9 +923,9 @@ func (c *client) processConnect(arg []byte) error {
 		}
 
 		// Check for Auth
-		if ok := srv.checkAuthorization(c); !ok {
+		if ok := srv.checkAuthentication(c); !ok {
 			c.authViolation()
-			return ErrAuthorization
+			return ErrAuthentication
 		}
 
 		// Check for Account designation
@@ -979,10 +996,29 @@ func (c *client) processConnect(arg []byte) error {
 	return nil
 }
 
+func (c *client) sendErrAndErr(err string) {
+	c.sendErr(err)
+	c.Errorf(err)
+}
+
+func (c *client) sendErrAndDebug(err string) {
+	c.sendErr(err)
+	c.Debugf(err)
+}
+
 func (c *client) authTimeout() {
-	c.sendErr(ErrAuthTimeout.Error())
-	c.Debugf("Authorization Timeout")
+	c.sendErrAndDebug("Authentication Timeout")
 	c.closeConnection(AuthenticationTimeout)
+}
+
+func (c *client) authExpired() {
+	c.sendErrAndDebug("User Authentication Expired")
+	c.closeConnection(AuthenticationExpired)
+}
+
+func (c *client) accountAuthExpired() {
+	c.sendErrAndDebug("Account Authentication Expired")
+	c.closeConnection(AuthenticationExpired)
 }
 
 func (c *client) authViolation() {
@@ -996,34 +1032,32 @@ func (c *client) authViolation() {
 	}
 	if hasTrustedNkeys {
 		if c.opts.JWT != "" {
-			c.Errorf("%s - User JWT Invalid", ErrAuthorization.Error())
+			c.Errorf("%v", ErrAuthentication)
 		} else {
-			c.Errorf("%s - User JWT Missing", ErrAuthorization.Error())
+			c.Errorf("%v", ErrAuthentication)
 		}
 	} else if hasNkeys {
 		c.Errorf("%s - Nkey %q",
-			ErrAuthorization.Error(),
+			ErrAuthentication.Error(),
 			c.opts.Nkey)
 	} else if hasUsers {
 		c.Errorf("%s - User %q",
-			ErrAuthorization.Error(),
+			ErrAuthentication.Error(),
 			c.opts.Username)
 	} else {
-		c.Errorf(ErrAuthorization.Error())
+		c.Errorf(ErrAuthentication.Error())
 	}
 	c.sendErr("Authorization Violation")
 	c.closeConnection(AuthenticationViolation)
 }
 
 func (c *client) maxConnExceeded() {
-	c.Errorf(ErrTooManyConnections.Error())
-	c.sendErr(ErrTooManyConnections.Error())
+	c.sendErrAndErr(ErrTooManyConnections.Error())
 	c.closeConnection(MaxConnectionsExceeded)
 }
 
 func (c *client) maxSubsExceeded() {
-	c.Errorf(ErrTooManySubs.Error())
-	c.sendErr(ErrTooManySubs.Error())
+	c.sendErrAndErr(ErrTooManySubs.Error())
 }
 
 func (c *client) maxPayloadViolation(sz int, max int64) {
@@ -1559,7 +1593,7 @@ func (c *client) unsubscribe(acc *Account, sub *subscription, force bool) {
 	defer c.mu.Unlock()
 	if !force && sub.max > 0 && sub.nm < sub.max {
 		c.Debugf(
-			"Deferring actual UNSUB(%s): %d max, %d received\n",
+			"Deferring actual UNSUB(%s): %d max, %d received",
 			string(sub.subject), sub.max, sub.nm)
 		return
 	}
@@ -1712,7 +1746,7 @@ func (c *client) deliverMsg(sub *subscription, mh, msg []byte) bool {
 			// still process the message in hand, otherwise
 			// unsubscribe and drop message on the floor.
 			if sub.nm == sub.max {
-				client.Debugf("Auto-unsubscribe limit of %d reached for sid '%s'\n", sub.max, string(sub.sid))
+				client.Debugf("Auto-unsubscribe limit of %d reached for sid '%s'", sub.max, string(sub.sid))
 				// Due to defer, reverse the code order so that execution
 				// is consistent with other cases where we unsubscribe.
 				if shouldForward {
@@ -1720,7 +1754,7 @@ func (c *client) deliverMsg(sub *subscription, mh, msg []byte) bool {
 				}
 				defer client.unsubscribe(client.acc, sub, true)
 			} else if sub.nm > sub.max {
-				client.Debugf("Auto-unsubscribe limit [%d] exceeded\n", sub.max)
+				client.Debugf("Auto-unsubscribe limit [%d] exceeded", sub.max)
 				client.mu.Unlock()
 				client.unsubscribe(client.acc, sub, true)
 				if shouldForward {
@@ -2245,11 +2279,21 @@ func (c *client) clearAuthTimer() bool {
 	return stopped
 }
 
-func (c *client) isAuthTimerSet() bool {
+// We may reuse atmr for expiring user jwts,
+// so check connectReceived.
+func (c *client) awaitingAuth() bool {
 	c.mu.Lock()
-	isSet := c.atmr != nil
+	authSet := !c.flags.isSet(connectReceived) && c.atmr != nil
 	c.mu.Unlock()
-	return isSet
+	return authSet
+}
+
+// This will set the atmr for the JWT expiration time.
+// We will lock on entry.
+func (c *client) setExpirationTimer(d time.Duration) {
+	c.mu.Lock()
+	c.atmr = time.AfterFunc(d, c.authExpired)
+	c.mu.Unlock()
 }
 
 // Lock should be held

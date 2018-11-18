@@ -1322,10 +1322,10 @@ func TestNewRouteLargeDistinctQueueSubscribers(t *testing.T) {
 	}
 	ncA.Flush()
 
-	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
 		for i := 0; i < nqsubs; i++ {
 			if n, _, _ := qsubs[i].Pending(); n != 10 {
-				return fmt.Errorf("Number of messgaes is %d", n)
+				return fmt.Errorf("Number of messages is %d", n)
 			}
 		}
 		return nil

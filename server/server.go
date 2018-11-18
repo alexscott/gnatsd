@@ -401,6 +401,20 @@ func (s *Server) NumActiveAccounts() int {
 	return s.activeAccounts
 }
 
+// incActiveAccounts() just adds one under lock.
+func (s *Server) incActiveAccounts() {
+	s.mu.Lock()
+	s.activeAccounts++
+	s.mu.Unlock()
+}
+
+// dev=cActiveAccounts() just subtracts one under lock.
+func (s *Server) decActiveAccounts() {
+	s.mu.Lock()
+	s.activeAccounts--
+	s.mu.Unlock()
+}
+
 // LookupOrRegisterAccount will return the given account if known or create a new entry.
 func (s *Server) LookupOrRegisterAccount(name string) (account *Account, isNew bool) {
 	s.mu.Lock()
@@ -441,6 +455,9 @@ func (s *Server) registerAccount(acc *Account) {
 	if acc.maxaettl == 0 {
 		acc.maxaettl = DEFAULT_TTL_AE_RESPONSE_MAP
 	}
+	if acc.clients == nil {
+		acc.clients = make(map[*client]*client)
+	}
 	// If we are capable of routing we will track subscription
 	// information for efficient interest propagation.
 	// During config reload, it is possible that account was
@@ -458,26 +475,35 @@ func (s *Server) registerAccount(acc *Account) {
 // associated with name.
 func (s *Server) LookupAccount(name string) *Account {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	acc := s.accounts[name]
-	accResolver := s.accResolver
-	s.mu.Unlock()
 	if acc != nil {
 		return acc
 	}
-	// If we have a resolver see if it can fetch the account. We need to
-	// do this without the lock
-	if accResolver != nil {
-		fmt.Printf("TRying to Fetch! %q\n\n", name)
-		if accClaims, err := accResolver.Fetch(name); err == nil {
-			fmt.Printf("accClaims is %+v\n", accClaims)
-			if acc := buildInternalAccount(accClaims); acc != nil {
-				s.mu.Lock()
-				s.registerAccount(acc)
-				s.mu.Unlock()
-				return acc
-			}
-			return nil
-		}
+	// If we have a resolver see if it can fetch the account.
+	return s.FetchAccount(name)
+}
+
+// This will fetch an account from a resolver if defined.
+// Lock should be held.
+func (s *Server) FetchAccount(name string) *Account {
+	accResolver := s.accResolver
+	if accResolver == nil {
+		return nil
+	}
+
+	// Need to do actual Fetch without the lock.
+	s.mu.Unlock()
+	accClaims, err := accResolver.Fetch(name)
+	s.mu.Lock()
+
+	if err != nil {
+		return nil
+	}
+	if acc := buildInternalAccount(accClaims); acc != nil {
+		s.registerAccount(acc)
+		return acc
 	}
 	return nil
 }

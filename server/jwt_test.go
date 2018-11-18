@@ -46,12 +46,18 @@ func opTrustBasicSetup() *Server {
 }
 
 func buildMemAccResolver(s *Server) {
-	s.mu.Lock()
 	kp, _ := nkeys.FromSeed(aSeed)
 	pub, _ := kp.PublicKey()
 	mr := &memAccResolver{}
 	mr.Store(string(pub), aJWT)
+	s.mu.Lock()
 	s.accResolver = mr
+	s.mu.Unlock()
+}
+
+func addAccountToMemResolver(s *Server, pub, jwt string) {
+	s.mu.Lock()
+	s.accResolver.(*memAccResolver).Store(pub, jwt)
 	s.mu.Unlock()
 }
 
@@ -175,6 +181,57 @@ func TestJWTUserExpired(t *testing.T) {
 	}
 }
 
+func TestJWTUserExpiresAfterConnect(t *testing.T) {
+	// Create a new user that we will make sure has expired.
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	claims := nuc.Claims()
+	claims.IssuedAt = time.Now().Unix()
+	claims.Expires = time.Now().Add(time.Second).Unix()
+
+	akp, _ := nkeys.FromSeed(aSeed)
+	jwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	s := opTrustBasicSetup()
+	buildMemAccResolver(s)
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail too since no account resolver is defined.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", jwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected a PONG")
+	}
+
+	// Now we should expire after 1 second or so.
+	time.Sleep(time.Second)
+
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR ") {
+		t.Fatalf("Expected an error")
+	}
+	if !strings.Contains(l, "Expired") {
+		t.Fatalf("Expected 'Expired' to be in the error")
+	}
+}
+
 func TestJWTUserPermissionClaims(t *testing.T) {
 	nkp, _ := nkeys.CreateUser()
 	pub, _ := nkp.PublicKey()
@@ -231,5 +288,211 @@ func TestJWTUserPermissionClaims(t *testing.T) {
 	}
 	if lsd := c.perms.sub.deny.Count(); lsd != 1 {
 		t.Fatalf("Expected 1 subscribe deny subjects, got %d", lsd)
+	}
+}
+
+func TestJWTAccountExpired(t *testing.T) {
+	s := opTrustBasicSetup()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create an account that will be expired.
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(string(apub))
+	claims := nac.Claims()
+	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	claims.Expires = time.Now().Add(-2 * time.Second).Unix()
+	ajwt, err := nac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	addAccountToMemResolver(s, string(apub), ajwt)
+
+	// Create a new user
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	jwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail since the account is expired.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", jwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR ") {
+		t.Fatalf("Expected an error")
+	}
+}
+
+func TestJWTAccountExpiresAfterConnect(t *testing.T) {
+	s := opTrustBasicSetup()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create an account that will expire.
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(string(apub))
+	claims := nac.Claims()
+	claims.IssuedAt = time.Now().Unix()
+	claims.Expires = time.Now().Add(time.Second).Unix()
+	ajwt, err := nac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	addAccountToMemResolver(s, string(apub), ajwt)
+
+	// Create a new user
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	jwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", jwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected a PONG")
+	}
+
+	// Now we should expire after 1 second or so.
+	time.Sleep(time.Second)
+
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR ") {
+		t.Fatalf("Expected an error")
+	}
+	if !strings.Contains(l, "Expired") {
+		t.Fatalf("Expected 'Expired' to be in the error")
+	}
+
+	// Now make sure that accounts that have expired return error.
+	c, cr, l = newClientForServer(s)
+
+	// Sign Nonce
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ = nkp.Sign([]byte(info.Nonce))
+	sig = base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	cs = fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", jwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR ") {
+		t.Fatalf("Expected an error")
+	}
+}
+
+func TestJWTAccountRenew(t *testing.T) {
+	s := opTrustBasicSetup()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create an account that has expired.
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(string(apub))
+	claims := nac.Claims()
+	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	claims.Expires = time.Now().Add(-2 * time.Second).Unix()
+	ajwt, err := nac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	addAccountToMemResolver(s, string(apub), ajwt)
+
+	// Create a new user
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	ujwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail since the account is expired.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", ujwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR ") {
+		t.Fatalf("Expected an error")
+	}
+
+	// Now update with new expiration
+
+	claims = nac.Claims()
+	claims.IssuedAt = time.Now().Unix()
+	claims.Expires = time.Now().Add(5 * time.Second).Unix()
+	ajwt, err = nac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	// Update the account
+	addAccountToMemResolver(s, string(apub), ajwt)
+	acc := s.LookupAccount(string(apub))
+	if acc == nil {
+		t.Fatalf("Expected to retrive the account")
+	}
+	acc.UpdateAccountClaims(nac)
+
+	// Now make sure we can connect.
+	c, cr, l = newClientForServer(s)
+
+	// Sign Nonce
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ = nkp.Sign([]byte(info.Nonce))
+	sig = base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail too since no account resolver is defined.
+	cs = fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", ujwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
 	}
 }

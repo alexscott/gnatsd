@@ -41,7 +41,8 @@ type Account struct {
 	Issuer   string
 	mu       sync.RWMutex
 	sl       *Sublist
-	clients  int
+	etmr     *time.Timer
+	clients  map[*client]*client
 	rm       map[string]*rme
 	imports  importMap
 	exports  exportMap
@@ -49,6 +50,7 @@ type Account struct {
 	maxnae   int
 	maxaettl time.Duration
 	pruning  bool
+	expired  bool
 }
 
 // Import stream mapping struct
@@ -83,7 +85,7 @@ type exportMap struct {
 func (a *Account) NumClients() int {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.clients
+	return len(a.clients)
 }
 
 // RoutedSubs returns how many subjects we would send across a route when first
@@ -102,12 +104,11 @@ func (a *Account) TotalSubs() int {
 }
 
 // addClient keeps our accounting of active clients updated.
-// Call in with client but just track total for now.
 // Returns previous total.
 func (a *Account) addClient(c *client) int {
 	a.mu.Lock()
-	n := a.clients
-	a.clients++
+	n := len(a.clients)
+	a.clients[c] = c
 	a.mu.Unlock()
 	return n
 }
@@ -115,8 +116,8 @@ func (a *Account) addClient(c *client) int {
 // removeClient keeps our accounting of active clients updated.
 func (a *Account) removeClient(c *client) int {
 	a.mu.Lock()
-	n := a.clients
-	a.clients--
+	n := len(a.clients)
+	delete(a.clients, c)
 	a.mu.Unlock()
 	return n
 }
@@ -435,36 +436,73 @@ func (a *Account) checkServiceImportAuthorized(account *Account, subject string)
 	return ok
 }
 
-// AccountResolver interface. This is to fetch Account JWTs by public nkeys
-type AccountResolver interface {
-	Fetch(pub string) (*jwt.AccountClaims, error)
+// IsExpired returns expiration status.
+func (a *Account) IsExpired() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.expired
 }
 
-// Mostly for testing.
-type memAccResolver struct {
-	sync.Map
-}
+// Called when an account has expired.
+func (a *Account) expiredTimeout() {
+	// Collect the clients.
+	a.mu.Lock()
+	a.expired = true
+	a.mu.Unlock()
 
-func (m *memAccResolver) Fetch(pub string) (*jwt.AccountClaims, error) {
-	if j, ok := m.Load(pub); ok {
-		if acc, err := jwt.DecodeAccountClaims(j.(string)); err != nil {
-			return nil, err
-		} else {
-			vr := jwt.CreateValidationResults()
-			acc.Validate(vr)
-			if vr.IsBlocking(true) {
-				return nil, ErrAccountValidation
-			}
-			return acc, nil
-		}
+	cs := make([]*client, 0, len(a.clients))
+	a.mu.RLock()
+	for c := range a.clients {
+		cs = append(cs, c)
 	}
-	return nil, ErrMissingAccount
+	a.mu.RUnlock()
+
+	for _, c := range cs {
+		c.accountAuthExpired()
+	}
+}
+
+// Sets the expiration timer for an account JWT that has it set.
+func (a *Account) setExpirationTimer(d time.Duration) {
+	a.etmr = time.AfterFunc(d, a.expiredTimeout)
+}
+
+// Lock should be held
+func (a *Account) clearExpirationTimer() bool {
+	if a.etmr == nil {
+		return true
+	}
+	stopped := a.etmr.Stop()
+	a.etmr = nil
+	return stopped
+}
+
+func (a *Account) checkExpiration(claims *jwt.ClaimsData) {
+	a.clearExpirationTimer()
+	if claims.Expires == 0 {
+		a.expired = false
+		return
+	}
+	tn := time.Now().Unix()
+	if claims.Expires < tn {
+		return
+	}
+	expiresAt := time.Duration(claims.Expires - tn)
+	a.setExpirationTimer(expiresAt * time.Second)
+	a.expired = false
+}
+
+// UpdateAccountClaims will update and existing account with new claims.
+func (a *Account) UpdateAccountClaims(ac *jwt.AccountClaims) {
+	a.checkExpiration(ac.Claims())
+	// FIXME(dlc) - Imports and Exports, Limits etc..
 }
 
 // Helper to build an internal account structure from a jwt.AccountClaims.
 func buildInternalAccount(ac *jwt.AccountClaims) *Account {
 	acc := &Account{Name: ac.Subject, Issuer: ac.Issuer}
-	// FIXME(dlc) - Imports and Exports, Limits etc..
+	acc.checkExpiration(ac.Claims())
+	acc.UpdateAccountClaims(ac)
 	return acc
 }
 
@@ -493,4 +531,30 @@ func buildInternalNkeyUser(uc *jwt.UserClaims, acc *Account) *NkeyUser {
 	}
 	nu.Permissions = p
 	return nu
+}
+
+// AccountResolver interface. This is to fetch Account JWTs by public nkeys
+type AccountResolver interface {
+	Fetch(pub string) (*jwt.AccountClaims, error)
+}
+
+// Mostly for testing.
+type memAccResolver struct {
+	sync.Map
+}
+
+func (m *memAccResolver) Fetch(pub string) (*jwt.AccountClaims, error) {
+	if j, ok := m.Load(pub); ok {
+		if acc, err := jwt.DecodeAccountClaims(j.(string)); err != nil {
+			return nil, err
+		} else {
+			vr := jwt.CreateValidationResults()
+			acc.Validate(vr)
+			if vr.IsBlocking(true) {
+				return nil, ErrAccountValidation
+			}
+			return acc, nil
+		}
+	}
+	return nil, ErrMissingAccount
 }

@@ -208,9 +208,9 @@ func (s *Server) configureAuthorization() {
 	}
 }
 
-// checkAuthorization will check authorization based on client type and
+// checkAuthentication will check based on client type and
 // return boolean indicating if client is authorized.
-func (s *Server) checkAuthorization(c *client) bool {
+func (s *Server) checkAuthentication(c *client) bool {
 	switch c.typ {
 	case CLIENT:
 		return s.isClientAuthorized(c)
@@ -237,6 +237,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		return customClientAuthentication.Check(c)
 	}
 
+	// Grab under lock but process after.
 	var (
 		nkey *NkeyUser
 		juc  *jwt.UserClaims
@@ -258,6 +259,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	if s.trustedNkeys != nil {
 		if c.opts.JWT == "" {
 			s.mu.Unlock()
+			c.Debugf("Authentication requires a user JWT")
 			return false
 		}
 		// So we have a valid user jwt here.
@@ -265,12 +267,14 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		if err != nil {
 			// Should we debug log here?
 			s.mu.Unlock()
+			c.Debugf("User JWT not valid: %v", err)
 			return false
 		}
 		vr := jwt.CreateValidationResults()
 		juc.Validate(vr)
 		if vr.IsBlocking(true) {
 			s.mu.Unlock()
+			c.Debugf("User JWT no longer valid: %+v", vr)
 			return false
 		}
 	}
@@ -294,34 +298,44 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	s.mu.Unlock()
 
 	// If we have a jwt and a userClaim, make sure we have the Account, etc associated.
-	// We need to look up the account. This will use a resolver if one is present.
+	// We need to look up the account. This will use an account  resolver if one is present.
 	if juc != nil {
 		if acc = s.LookupAccount(juc.Issuer); acc == nil {
 			return false
 		}
 		if !s.isTrustedIssuer(acc.Issuer) {
+			c.Debugf("Account JWT not signed by trusted operator")
 			return false
 		}
-	}
+		if acc.IsExpired() {
+			c.Debugf("Account JWT has expired")
+			return false
+		}
 
-	// Verify the signature against the nonce.
-	if juc != nil {
+		// Verify the signature against the nonce.
 		if c.opts.Sig == "" {
+			c.Debugf("Signature missing")
 			return false
 		}
 		sig, err := base64.StdEncoding.DecodeString(c.opts.Sig)
 		if err != nil {
+			c.Debugf("Signature not valid base64")
 			return false
 		}
 		pub, err := nkeys.FromPublicKey([]byte(juc.Subject))
 		if err != nil {
+			c.Debugf("User nkey not valid: %v", err)
 			return false
 		}
 		if err := pub.Verify(c.nonce, sig); err != nil {
+			c.Debugf("Signature not verified")
 			return false
 		}
 		nkey = buildInternalNkeyUser(juc, acc)
 		c.RegisterNkeyUser(nkey)
+
+		// Check if we need to set an auth timer if the jwt expires.
+		c.checkExpiration(juc.Claims())
 		return true
 	}
 
