@@ -2001,7 +2001,7 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 		if c.pa.reply != nil {
 			// We want to remap this to provide anonymity.
 			nrr = c.newServiceReply()
-			rm.acc.addImplicitServiceImport(acc, string(nrr), string(c.pa.reply), true)
+			rm.acc.addImplicitServiceImport(acc, string(nrr), string(c.pa.reply), true, nil)
 		}
 		// FIXME(dlc) - Do L1 cache trick from above.
 		rr := rm.acc.sl.Match(rm.to)

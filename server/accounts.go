@@ -61,7 +61,7 @@ type streamImport struct {
 	acc    *Account
 	from   string
 	prefix string
-	token  string
+	claim  *jwt.Import
 }
 
 // Import service mapping struct
@@ -69,9 +69,9 @@ type serviceImport struct {
 	acc   *Account
 	from  string
 	to    string
-	token string
 	ae    bool
 	ts    int64
+	claim *jwt.Import
 }
 
 // exportAuth holds configured approvals or boolean indicating an
@@ -184,7 +184,7 @@ func (a *Account) AddServiceImportWithClaim(destination *Account, from, to strin
 		return ErrServiceImportAuthorization
 	}
 
-	return a.addImplicitServiceImport(destination, from, to, false)
+	return a.addImplicitServiceImport(destination, from, to, false, imClaim)
 }
 
 // AddServiceImport will add a route to an account to send published messages / requests
@@ -265,12 +265,12 @@ func (a *Account) autoExpireResponseMaps() []*serviceImport {
 // Add a route to connect from an implicit route created for a response to a request.
 // This does no checks and should be only called by the msg processing code. Use
 // addServiceImport from above if responding to user input or config, etc.
-func (a *Account) addImplicitServiceImport(destination *Account, from, to string, autoexpire bool) error {
+func (a *Account) addImplicitServiceImport(destination *Account, from, to string, autoexpire bool, claim *jwt.Import) error {
 	a.mu.Lock()
 	if a.imports.services == nil {
 		a.imports.services = make(map[string]*serviceImport)
 	}
-	si := &serviceImport{destination, from, to, "", autoexpire, 0}
+	si := &serviceImport{destination, from, to, autoexpire, 0, claim}
 	a.imports.services[from] = si
 	if autoexpire {
 		a.nae++
@@ -346,7 +346,7 @@ func (a *Account) AddStreamImportWithClaim(account *Account, from, prefix string
 		prefix = prefix + string(btsep)
 	}
 	// TODO(dlc) - collisions, etc.
-	a.imports.streams[from] = &streamImport{account, from, prefix, ""}
+	a.imports.streams[from] = &streamImport{account, from, prefix, imClaim}
 	return nil
 }
 
@@ -407,7 +407,6 @@ func (a *Account) checkStreamImportAuthorized(account *Account, subject string, 
 		if ea != nil && ea.tokenReq {
 			return a.checkActivation(imClaim)
 		}
-
 		// If we have a matching account we are authorized
 		_, ok := ea.approved[account.Name]
 		return ok
@@ -421,6 +420,10 @@ func (a *Account) checkStreamImportAuthorized(account *Account, subject string, 
 		if isSubsetMatch(tokens, subj) {
 			if ea == nil || ea.approved == nil {
 				return true
+			}
+			// Check if token required
+			if ea != nil && ea.tokenReq {
+				return a.checkActivation(imClaim)
 			}
 			_, ok := ea.approved[account.Name]
 			return ok
