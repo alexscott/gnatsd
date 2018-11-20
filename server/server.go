@@ -501,7 +501,7 @@ func (s *Server) FetchAccount(name string) *Account {
 	if err != nil {
 		return nil
 	}
-	if acc := buildInternalAccount(accClaims); acc != nil {
+	if acc := s.buildInternalAccount(accClaims); acc != nil {
 		s.registerAccount(acc)
 		return acc
 	}

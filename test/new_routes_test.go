@@ -1315,6 +1315,12 @@ func TestNewRouteLargeDistinctQueueSubscribers(t *testing.T) {
 		qsubs[i], _ = ncB.QueueSubscribeSync("foo", qg)
 	}
 	ncB.Flush()
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if ns := srvA.NumSubscriptions(); ns != 100 {
+			return fmt.Errorf("Number of subscriptions is %d", ns)
+		}
+		return nil
+	})
 
 	// Send 10 messages. We should receive 1000 responses.
 	for i := 0; i < 10; i++ {

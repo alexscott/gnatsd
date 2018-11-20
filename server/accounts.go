@@ -14,6 +14,9 @@
 package server
 
 import (
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -58,15 +61,24 @@ type streamImport struct {
 	acc    *Account
 	from   string
 	prefix string
+	token  string
 }
 
 // Import service mapping struct
 type serviceImport struct {
-	acc  *Account
-	from string
-	to   string
-	ae   bool
-	ts   int64
+	acc   *Account
+	from  string
+	to    string
+	token string
+	ae    bool
+	ts    int64
+}
+
+// exportAuth holds configured approvals or boolean indicating an
+// auth token is required for import.
+type exportAuth struct {
+	tokenReq bool
+	approved map[string]*Account
 }
 
 // importMap tracks the imported streams and services.
@@ -77,8 +89,8 @@ type importMap struct {
 
 // exportMap tracks the exported streams and services.
 type exportMap struct {
-	streams  map[string]map[string]*Account
-	services map[string]map[string]*Account
+	streams  map[string]*exportAuth
+	services map[string]*exportAuth
 }
 
 // NumClients returns active number of clients for this account.
@@ -130,16 +142,22 @@ func (a *Account) AddServiceExport(subject string, accounts []*Account) error {
 		return ErrMissingAccount
 	}
 	if a.exports.services == nil {
-		a.exports.services = make(map[string]map[string]*Account)
+		a.exports.services = make(map[string]*exportAuth)
 	}
-	ma := a.exports.services[subject]
-	if accounts != nil && ma == nil {
-		ma = make(map[string]*Account)
+	ea := a.exports.services[subject]
+	if accounts != nil && ea == nil {
+		ea = &exportAuth{}
+		// empty means auth required but will be import token.
+		if len(accounts) == 0 {
+			ea.tokenReq = true
+		} else {
+			ea.approved = make(map[string]*Account)
+			for _, acc := range accounts {
+				ea.approved[acc.Name] = acc
+			}
+		}
 	}
-	for _, a := range accounts {
-		ma[a.Name] = a
-	}
-	a.exports.services[subject] = ma
+	a.exports.services[subject] = ea
 	return nil
 }
 
@@ -150,11 +168,7 @@ func (a *Account) numServiceRoutes() int {
 	return len(a.imports.services)
 }
 
-// AddServiceImport will add a route to an account to send published messages / requests
-// to the destination account. From is the local subject to map, To is the
-// subject that will appear on the destination account. Destination will need
-// to have an import rule to allow access via addService.
-func (a *Account) AddServiceImport(destination *Account, from, to string) error {
+func (a *Account) AddServiceImportWithClaim(destination *Account, from, to string, imClaim *jwt.Import) error {
 	if destination == nil {
 		return ErrMissingAccount
 	}
@@ -166,11 +180,19 @@ func (a *Account) AddServiceImport(destination *Account, from, to string) error 
 		return ErrInvalidSubject
 	}
 	// First check to see if the account has authorized us to route to the "to" subject.
-	if !destination.checkServiceImportAuthorized(a, to) {
+	if !destination.checkServiceImportAuthorized(a, to, imClaim) {
 		return ErrServiceImportAuthorization
 	}
 
 	return a.addImplicitServiceImport(destination, from, to, false)
+}
+
+// AddServiceImport will add a route to an account to send published messages / requests
+// to the destination account. From is the local subject to map, To is the
+// subject that will appear on the destination account. Destination will need
+// to have an import rule to allow access via addService.
+func (a *Account) AddServiceImport(destination *Account, from, to string) error {
+	return a.AddServiceImportWithClaim(destination, from, to, nil)
 }
 
 // removeServiceImport will remove the route by subject.
@@ -248,7 +270,7 @@ func (a *Account) addImplicitServiceImport(destination *Account, from, to string
 	if a.imports.services == nil {
 		a.imports.services = make(map[string]*serviceImport)
 	}
-	si := &serviceImport{destination, from, to, autoexpire, 0}
+	si := &serviceImport{destination, from, to, "", autoexpire, 0}
 	a.imports.services[from] = si
 	if autoexpire {
 		a.nae++
@@ -304,14 +326,14 @@ func (a *Account) pruneAutoExpireResponseMaps() {
 	}
 }
 
-// AddStreamImport will add in the stream import from a specific account.
-func (a *Account) AddStreamImport(account *Account, from, prefix string) error {
+// AddStreamImport will add in the stream import from a specific account with optional token.
+func (a *Account) AddStreamImportWithClaim(account *Account, from, prefix string, imClaim *jwt.Import) error {
 	if account == nil {
 		return ErrMissingAccount
 	}
 
 	// First check to see if the account has authorized export of the subject.
-	if !account.checkStreamImportAuthorized(a, from) {
+	if !account.checkStreamImportAuthorized(a, from, imClaim) {
 		return ErrStreamImportAuthorization
 	}
 
@@ -324,8 +346,13 @@ func (a *Account) AddStreamImport(account *Account, from, prefix string) error {
 		prefix = prefix + string(btsep)
 	}
 	// TODO(dlc) - collisions, etc.
-	a.imports.streams[from] = &streamImport{account, from, prefix}
+	a.imports.streams[from] = &streamImport{account, from, prefix, ""}
 	return nil
+}
+
+// AddStreamImport will add in the stream import from a specific account.
+func (a *Account) AddStreamImport(account *Account, from, prefix string) error {
+	return a.AddStreamImportWithClaim(account, from, prefix, nil)
 }
 
 // IsPublicExport is a placeholder to denote public export.
@@ -340,21 +367,27 @@ func (a *Account) AddStreamExport(subject string, accounts []*Account) error {
 		return ErrMissingAccount
 	}
 	if a.exports.streams == nil {
-		a.exports.streams = make(map[string]map[string]*Account)
+		a.exports.streams = make(map[string]*exportAuth)
 	}
-	var ma map[string]*Account
-	for _, aa := range accounts {
-		if ma == nil {
-			ma = make(map[string]*Account, len(accounts))
+	ea := a.exports.services[subject]
+	if accounts != nil && ea == nil {
+		ea = &exportAuth{}
+		// empty means auth required but will be import token.
+		if len(accounts) == 0 {
+			ea.tokenReq = true
+		} else {
+			ea.approved = make(map[string]*Account)
 		}
-		ma[aa.Name] = aa
 	}
-	a.exports.streams[subject] = ma
+	for _, acc := range accounts {
+		ea.approved[acc.Name] = acc
+	}
+	a.exports.streams[subject] = ea
 	return nil
 }
 
 // Check if another account is authorized to import from us.
-func (a *Account) checkStreamImportAuthorized(account *Account, subject string) bool {
+func (a *Account) checkStreamImportAuthorized(account *Account, subject string, imClaim *jwt.Import) bool {
 	// Find the subject in the exports list.
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -364,14 +397,19 @@ func (a *Account) checkStreamImportAuthorized(account *Account, subject string) 
 	}
 
 	// Check direct match of subject first
-	am, ok := a.exports.streams[subject]
+	ea, ok := a.exports.streams[subject]
 	if ok {
-		// if am is nil that denotes a public export
-		if am == nil {
+		// if ea is nil that denotes a public export
+		if ea == nil {
 			return true
 		}
+		// Check if token required
+		if ea != nil && ea.tokenReq {
+			return a.checkActivation(imClaim)
+		}
+
 		// If we have a matching account we are authorized
-		_, ok := am[account.Name]
+		_, ok := ea.approved[account.Name]
 		return ok
 	}
 	// ok if we are here we did not match directly so we need to test each one.
@@ -379,16 +417,55 @@ func (a *Account) checkStreamImportAuthorized(account *Account, subject string) 
 	// has to be a true subset of the import claim. We already checked for
 	// exact matches above.
 	tokens := strings.Split(subject, tsep)
-	for subj, am := range a.exports.streams {
+	for subj, ea := range a.exports.streams {
 		if isSubsetMatch(tokens, subj) {
-			if am == nil {
+			if ea == nil || ea.approved == nil {
 				return true
 			}
-			_, ok := am[account.Name]
+			_, ok := ea.approved[account.Name]
 			return ok
 		}
 	}
 	return false
+}
+
+// Will fetch the activation token for an import.
+func fetchActivation(url string) string {
+	// FIXME(dlc) - Make configurable.
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get(url)
+	if err != nil || resp == nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return string(body)
+}
+
+// checkActivation will check the activation token for validity.
+func (a *Account) checkActivation(claim *jwt.Import) bool {
+	if claim == nil || claim.Token == "" {
+		return false
+	}
+
+	// Create a quick clone so we can inline Token JWT.
+	clone := *claim
+
+	// We grab the token from a URL by hand here since we need expiration etc.
+	if url, err := url.Parse(clone.Token); err == nil && url.Scheme != "" {
+		clone.Token = fetchActivation(url.String())
+	}
+	vr := jwt.CreateValidationResults()
+	clone.Validate(a.Name, vr)
+	if vr.IsBlocking(true) {
+		return false
+	}
+	// TODO(dlc) - add expiration timer?
+	_, err := jwt.DecodeActivationClaims(clone.Token)
+	return err == nil
 }
 
 // Returns true if `a` and `b` stream imports are the same. Note that the
@@ -414,7 +491,7 @@ func (a *Account) checkStreamImportsEqual(b *Account) bool {
 }
 
 // Check if another account is authorized to route requests to this service.
-func (a *Account) checkServiceImportAuthorized(account *Account, subject string) bool {
+func (a *Account) checkServiceImportAuthorized(account *Account, subject string, imClaim *jwt.Import) bool {
 	// Find the subject in the services list.
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -423,16 +500,21 @@ func (a *Account) checkServiceImportAuthorized(account *Account, subject string)
 		return false
 	}
 	// These are always literal subjects so just lookup.
-	am, ok := a.exports.services[subject]
+	ae, ok := a.exports.services[subject]
 	if !ok {
 		return false
 	}
+
+	if ae != nil && ae.tokenReq {
+		return a.checkActivation(imClaim)
+	}
+
 	// Check to see if we are public or if we need to search for the account.
-	if am == nil {
+	if ae == nil || ae.approved == nil {
 		return true
 	}
 	// Check that we allow this account.
-	_, ok = am[account.Name]
+	_, ok = ae.approved[account.Name]
 	return ok
 }
 
@@ -492,17 +574,63 @@ func (a *Account) checkExpiration(claims *jwt.ClaimsData) {
 	a.expired = false
 }
 
+// Placeholder for signaling token auth required.
+var tokenAuthReq = []*Account{}
+
+func authAccounts(tokenReq bool) []*Account {
+	if tokenReq {
+		return tokenAuthReq
+	}
+	return nil
+}
+
 // UpdateAccountClaims will update and existing account with new claims.
-func (a *Account) UpdateAccountClaims(ac *jwt.AccountClaims) {
+// This will replace any exports or imports previously defined.
+func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
+	if a == nil {
+		return
+	}
 	a.checkExpiration(ac.Claims())
-	// FIXME(dlc) - Imports and Exports, Limits etc..
+
+	// Reset exports and imports here.
+	a.exports = exportMap{}
+	a.imports = importMap{}
+
+	for _, e := range ac.Exports {
+		switch e.Type {
+		case jwt.Stream:
+			if err := a.AddStreamExport(string(e.Subject), authAccounts(e.TokenReq)); err != nil {
+				s.Debugf("Error adding stream export to account [%s]: %v", a.Name, err.Error())
+			}
+		case jwt.Service:
+			if err := a.AddServiceExport(string(e.Subject), authAccounts(e.TokenReq)); err != nil {
+				s.Debugf("Error adding service export to account [%s]: %v", a.Name, err.Error())
+			}
+		}
+	}
+	for _, i := range ac.Imports {
+		acc := s.accounts[i.Account]
+		if acc == nil {
+			if acc = s.FetchAccount(i.Account); acc == nil {
+				s.Debugf("Can't locate account [%s] for import of [%v] %s", i.Account, i.Subject, i.Type)
+				continue
+			}
+		}
+		switch i.Type {
+		case jwt.Stream:
+			a.AddStreamImportWithClaim(acc, string(i.Subject), string(i.To), i)
+		case jwt.Service:
+			a.AddServiceImportWithClaim(acc, string(i.Subject), string(i.To), i)
+		}
+	}
+	// FIXME(dlc) - Limits etc..
 }
 
 // Helper to build an internal account structure from a jwt.AccountClaims.
-func buildInternalAccount(ac *jwt.AccountClaims) *Account {
+func (s *Server) buildInternalAccount(ac *jwt.AccountClaims) *Account {
 	acc := &Account{Name: ac.Subject, Issuer: ac.Issuer}
 	acc.checkExpiration(ac.Claims())
-	acc.UpdateAccountClaims(ac)
+	s.UpdateAccountClaims(acc, ac)
 	return acc
 }
 

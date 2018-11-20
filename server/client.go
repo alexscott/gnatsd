@@ -1454,7 +1454,7 @@ func (c *client) addShadowSubscriptions(acc *Account, sub *subscription) error {
 	acc.mu.RLock()
 	// Loop over the import subjects. We have 3 scenarios. If we exact
 	// match or we know the proposed subject is a strict subset of the
-	// import we can subscribe the subcsription's subject directly.
+	// import we can subscribe to the subscription's subject directly.
 	// The third scenario is where the proposed subject has a wildcard
 	// and may not be an exact subset, but is a match. Therefore we have to
 	// subscribe to the import subject, not the subscription's subject.
@@ -1468,7 +1468,7 @@ func (c *client) addShadowSubscriptions(acc *Account, sub *subscription) error {
 			tokens = tsa[:0]
 			start := 0
 			for i := 0; i < len(subj); i++ {
-				//This is not perfect, but the test below will
+				// This is not perfect, but the test below will
 				// be more exact, this is just to trigger the
 				// additional test.
 				if subj[i] == pwc || subj[i] == fwc {

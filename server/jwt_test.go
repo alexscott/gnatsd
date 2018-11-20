@@ -17,6 +17,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +65,8 @@ func addAccountToMemResolver(s *Server, pub, jwt string) {
 
 func TestJWTUser(t *testing.T) {
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
+
 	// Check to make sure we would have an authTimer
 	if !s.info.AuthRequired {
 		t.Fatalf("Expect the server to require auth")
@@ -114,6 +118,8 @@ func TestJWTUser(t *testing.T) {
 
 func TestJWTUserBadTrusted(t *testing.T) {
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
+
 	// Check to make sure we would have an authTimer
 	if !s.info.AuthRequired {
 		t.Fatalf("Expect the server to require auth")
@@ -161,6 +167,7 @@ func TestJWTUserExpired(t *testing.T) {
 	}
 
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
 	buildMemAccResolver(s)
 
 	c, cr, l := newClientForServer(s)
@@ -197,6 +204,7 @@ func TestJWTUserExpiresAfterConnect(t *testing.T) {
 	}
 
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
 	buildMemAccResolver(s)
 
 	c, cr, l := newClientForServer(s)
@@ -251,6 +259,7 @@ func TestJWTUserPermissionClaims(t *testing.T) {
 	}
 
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
 	buildMemAccResolver(s)
 
 	c, cr, l := newClientForServer(s)
@@ -293,6 +302,7 @@ func TestJWTUserPermissionClaims(t *testing.T) {
 
 func TestJWTAccountExpired(t *testing.T) {
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
 	buildMemAccResolver(s)
 
 	okp, _ := nkeys.FromSeed(oSeed)
@@ -340,6 +350,7 @@ func TestJWTAccountExpired(t *testing.T) {
 
 func TestJWTAccountExpiresAfterConnect(t *testing.T) {
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
 	buildMemAccResolver(s)
 
 	okp, _ := nkeys.FromSeed(oSeed)
@@ -417,6 +428,7 @@ func TestJWTAccountExpiresAfterConnect(t *testing.T) {
 
 func TestJWTAccountRenew(t *testing.T) {
 	s := opTrustBasicSetup()
+	defer s.Shutdown()
 	buildMemAccResolver(s)
 
 	okp, _ := nkeys.FromSeed(oSeed)
@@ -477,7 +489,7 @@ func TestJWTAccountRenew(t *testing.T) {
 	if acc == nil {
 		t.Fatalf("Expected to retrive the account")
 	}
-	acc.UpdateAccountClaims(nac)
+	s.UpdateAccountClaims(acc, nac)
 
 	// Now make sure we can connect.
 	c, cr, l = newClientForServer(s)
@@ -494,5 +506,192 @@ func TestJWTAccountRenew(t *testing.T) {
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
+	}
+}
+
+func TestJWTAccountBasicImportExport(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create accounts and imports/exports.
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(string(fooPub))
+
+	// Now create Exports.
+	streamExport := &jwt.Export{Subject: "foo", Type: jwt.Stream}
+	streamExport2 := &jwt.Export{Subject: "private", Type: jwt.Stream, TokenReq: true}
+	serviceExport := &jwt.Export{Subject: "req.echo", Type: jwt.Service, TokenReq: true}
+	serviceExport2 := &jwt.Export{Subject: "req.add", Type: jwt.Service, TokenReq: true}
+
+	fooAC.Exports.Add(streamExport, streamExport2, serviceExport, serviceExport2)
+	fooJWT, err := fooAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	addAccountToMemResolver(s, string(fooPub), fooJWT)
+
+	acc := s.LookupAccount(string(fooPub))
+	if acc == nil {
+		t.Fatalf("Expected to retrieve the account")
+	}
+
+	// Check to make sure exports transferred over.
+	if les := len(acc.exports.streams); les != 2 {
+		t.Fatalf("Expected exports streams len of 2, got %d", les)
+	}
+	if les := len(acc.exports.services); les != 2 {
+		t.Fatalf("Expected exports services len of 2, got %d", les)
+	}
+	_, ok := acc.exports.streams["foo"]
+	if !ok {
+		t.Fatalf("Expected to map a stream export")
+	}
+	se, ok := acc.exports.services["req.echo"]
+	if !ok || se == nil {
+		t.Fatalf("Expected to map a service export")
+	}
+	if !se.tokenReq {
+		t.Fatalf("Expected the service export to require tokens")
+	}
+
+	barKP, _ := nkeys.CreateAccount()
+	barPub, _ := barKP.PublicKey()
+	barAC := jwt.NewAccountClaims(string(barPub))
+
+	streamImport := &jwt.Import{Account: string(fooPub), Subject: "foo", To: "import.foo", Type: jwt.Stream}
+	serviceImport := &jwt.Import{Account: string(fooPub), Subject: "req.echo", Type: jwt.Service}
+	barAC.Imports.Add(streamImport, serviceImport)
+	barJWT, err := barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+
+	acc = s.LookupAccount(string(barPub))
+	if acc == nil {
+		t.Fatalf("Expected to retrieve the account")
+	}
+	if les := len(acc.imports.streams); les != 1 {
+		t.Fatalf("Expected imports streams len of 1, got %d", les)
+	}
+	// Our service import should have failed without a token.
+	if les := len(acc.imports.services); les != 0 {
+		t.Fatalf("Expected imports services len of 0, got %d", les)
+	}
+
+	// Now add in a bad activation token.
+	barAC = jwt.NewAccountClaims(string(barPub))
+	serviceImport = &jwt.Import{Account: string(fooPub), Subject: "req.echo", Token: "not a token", Type: jwt.Service}
+	barAC.Imports.Add(serviceImport)
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+
+	s.UpdateAccountClaims(acc, barAC)
+
+	// Our service import should have failed with a bad token.
+	if les := len(acc.imports.services); les != 0 {
+		t.Fatalf("Expected imports services len of 0, got %d", les)
+	}
+
+	// Now make a correct one.
+	barAC = jwt.NewAccountClaims(string(barPub))
+	serviceImport = &jwt.Import{Account: string(fooPub), Subject: "req.echo", Type: jwt.Service}
+
+	activation := jwt.NewActivationClaims(string(barPub))
+	activation.Exports = jwt.Exports{}
+	activation.Exports.Add(&jwt.Export{Subject: "req.echo", Type: jwt.Service})
+	actJWT, err := activation.Encode(fooKP)
+	if err != nil {
+		t.Fatalf("Error generating activation token: %v", err)
+	}
+	serviceImport.Token = actJWT
+	barAC.Imports.Add(serviceImport)
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+	s.UpdateAccountClaims(acc, barAC)
+	// Our service import should have succeeded.
+	if les := len(acc.imports.services); les != 1 {
+		t.Fatalf("Expected imports services len of 1, got %d", les)
+	}
+
+	// Now test url
+	barAC = jwt.NewAccountClaims(string(barPub))
+	serviceImport = &jwt.Import{Account: string(fooPub), Subject: "req.add", Type: jwt.Service}
+
+	activation = jwt.NewActivationClaims(string(barPub))
+	activation.Exports = jwt.Exports{}
+	activation.Exports.Add(&jwt.Export{Subject: "req.add", Type: jwt.Service})
+	actJWT, err = activation.Encode(fooKP)
+	if err != nil {
+		t.Fatalf("Error generating activation token: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(actJWT))
+	}))
+	defer ts.Close()
+
+	serviceImport.Token = ts.URL
+	barAC.Imports.Add(serviceImport)
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+	s.UpdateAccountClaims(acc, barAC)
+	// Our service import should have succeeded. Should be the only one since we reset.
+	if les := len(acc.imports.services); les != 1 {
+		t.Fatalf("Expected imports services len of 1, got %d", les)
+	}
+
+	// Now streams
+	barAC = jwt.NewAccountClaims(string(barPub))
+	streamImport = &jwt.Import{Account: string(fooPub), Subject: "private", To: "import.private", Type: jwt.Stream}
+
+	barAC.Imports.Add(streamImport)
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+	s.UpdateAccountClaims(acc, barAC)
+	// Our stream import should have not succeeded.
+	if les := len(acc.imports.streams); les != 0 {
+		t.Fatalf("Expected imports services len of 0, got %d", les)
+	}
+
+	// Now add in activation.
+	barAC = jwt.NewAccountClaims(string(barPub))
+	streamImport = &jwt.Import{Account: string(fooPub), Subject: "private", To: "import.private", Type: jwt.Stream}
+
+	activation = jwt.NewActivationClaims(string(barPub))
+	activation.Exports = jwt.Exports{}
+	activation.Exports.Add(&jwt.Export{Subject: "private", Type: jwt.Stream})
+	actJWT, err = activation.Encode(fooKP)
+	if err != nil {
+		t.Fatalf("Error generating activation token: %v", err)
+	}
+	streamImport.Token = actJWT
+	barAC.Imports.Add(streamImport)
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+	s.UpdateAccountClaims(acc, barAC)
+	// Our stream import should have not succeeded.
+	if les := len(acc.imports.streams); les != 1 {
+		t.Fatalf("Expected imports services len of 1, got %d", les)
 	}
 }
