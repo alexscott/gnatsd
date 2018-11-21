@@ -298,9 +298,10 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	s.mu.Unlock()
 
 	// If we have a jwt and a userClaim, make sure we have the Account, etc associated.
-	// We need to look up the account. This will use an account  resolver if one is present.
+	// We need to look up the account. This will use an account resolver if one is present.
 	if juc != nil {
 		if acc = s.LookupAccount(juc.Issuer); acc == nil {
+			c.Debugf("Account JWT can not be found")
 			return false
 		}
 		if !s.isTrustedIssuer(acc.Issuer) {
@@ -311,7 +312,6 @@ func (s *Server) isClientAuthorized(c *client) bool {
 			c.Debugf("Account JWT has expired")
 			return false
 		}
-
 		// Verify the signature against the nonce.
 		if c.opts.Sig == "" {
 			c.Debugf("Signature missing")
@@ -334,7 +334,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		nkey = buildInternalNkeyUser(juc, acc)
 		c.RegisterNkeyUser(nkey)
 
-		// Check if we need to set an auth timer if the jwt expires.
+		// Check if we need to set an auth timer if the user jwt expires.
 		c.checkExpiration(juc.Claims())
 		return true
 	}

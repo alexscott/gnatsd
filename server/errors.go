@@ -71,6 +71,9 @@ var (
 	// ErrAccountValidation is returned when an account has failed validation.
 	ErrAccountValidation = errors.New("Account Validation Failed")
 
+	// ErrNoAccountResolver is returned when we attempt an update but do not have an account resolver.
+	ErrNoAccountResolver = errors.New("Account Resolver Missing")
+
 	// ErrStreamImportAuthorization is returned when a stream import is not authorized.
 	ErrStreamImportAuthorization = errors.New("Stream Import Not Authorized")
 

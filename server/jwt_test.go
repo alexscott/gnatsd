@@ -409,7 +409,7 @@ func TestJWTAccountExpiresAfterConnect(t *testing.T) {
 		t.Fatalf("Expected 'Expired' to be in the error")
 	}
 
-	// Now make sure that accounts that have expired return error.
+	// Now make sure that accounts that have expired return an error.
 	c, cr, l = newClientForServer(s)
 
 	// Sign Nonce
@@ -490,6 +490,90 @@ func TestJWTAccountRenew(t *testing.T) {
 		t.Fatalf("Expected to retrive the account")
 	}
 	s.UpdateAccountClaims(acc, nac)
+
+	// Now make sure we can connect.
+	c, cr, l = newClientForServer(s)
+
+	// Sign Nonce
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ = nkp.Sign([]byte(info.Nonce))
+	sig = base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail too since no account resolver is defined.
+	cs = fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", ujwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+}
+
+func TestJWTAccountRenewFromResolver(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create an account that has expired.
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(string(apub))
+	claims := nac.Claims()
+	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	claims.Expires = time.Now().Unix()
+	ajwt, err := nac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	addAccountToMemResolver(s, string(apub), ajwt)
+	// Force it to be loaded by the server and start the expiration timer.
+	acc := s.LookupAccount(string(apub))
+
+	// Create a new user
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	ujwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail since the account is expired.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", ujwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR ") {
+		t.Fatalf("Expected an error")
+	}
+
+	// Now update with new expiration
+	claims = nac.Claims()
+	claims.IssuedAt = time.Now().Unix()
+	claims.Expires = time.Now().Add(5 * time.Second).Unix()
+	ajwt, err = nac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	// Update the account
+	addAccountToMemResolver(s, string(apub), ajwt)
+	// Make sure the too quick update suppression does not bite us.
+	acc.updated = time.Now().Add(-1 * time.Hour)
+
+	// Do not update the account directly. The resolver should
+	// happen automatically.
 
 	// Now make sure we can connect.
 	c, cr, l = newClientForServer(s)
@@ -694,4 +778,144 @@ func TestJWTAccountBasicImportExport(t *testing.T) {
 	if les := len(acc.imports.streams); les != 1 {
 		t.Fatalf("Expected imports services len of 1, got %d", les)
 	}
+}
+
+func TestJWTAccountImportExportUpdates(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create accounts and imports/exports.
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(string(fooPub))
+	streamExport := &jwt.Export{Subject: "foo", Type: jwt.Stream}
+
+	fooAC.Exports.Add(streamExport)
+	fooJWT, err := fooAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(fooPub), fooJWT)
+
+	barKP, _ := nkeys.CreateAccount()
+	barPub, _ := barKP.PublicKey()
+	barAC := jwt.NewAccountClaims(string(barPub))
+	streamImport := &jwt.Import{Account: string(fooPub), Subject: "foo", To: "import", Type: jwt.Stream}
+
+	barAC.Imports.Add(streamImport)
+	barJWT, err := barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+
+	// Create a client.
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	ujwt, err := nuc.Encode(barKP)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail too since no account resolver is defined.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nSUB import.foo 1\r\nPING\r\n", ujwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "PONG\r\n") {
+		t.Fatalf("PONG response incorrect: %q\n", l)
+	}
+
+	checkShadow := func(expected int) {
+		t.Helper()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		sub := c.subs["1"]
+		if ls := len(sub.shadow); ls != expected {
+			t.Fatalf("Expected shadows to be %d, got %d", expected, ls)
+		}
+	}
+
+	// We Created a SUB on foo which should create a shadow subscription.
+	checkShadow(1)
+
+	// Now update bar and remove the import which should make the shadow go away.
+	barAC = jwt.NewAccountClaims(string(barPub))
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+	acc := s.LookupAccount(string(barPub))
+	s.UpdateAccountClaims(acc, barAC)
+
+	checkShadow(0)
+
+	// Now add it back and make sure the shadow comes back.
+	streamImport = &jwt.Import{Account: string(fooPub), Subject: "foo", To: "import", Type: jwt.Stream}
+	barAC.Imports.Add(streamImport)
+	barJWT, err = barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+	s.UpdateAccountClaims(acc, barAC)
+
+	checkShadow(1)
+
+	// Now change export and make sure it goes away as well. So no exports anymore.
+	fooAC = jwt.NewAccountClaims(string(fooPub))
+	fooJWT, err = fooAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(fooPub), fooJWT)
+	s.UpdateAccountClaims(s.LookupAccount(string(fooPub)), fooAC)
+
+	checkShadow(0)
+
+	// Now add it in but with permission required.
+	streamExport = &jwt.Export{Subject: "foo", Type: jwt.Stream, TokenReq: true}
+	fooAC.Exports.Add(streamExport)
+	fooJWT, err = fooAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(fooPub), fooJWT)
+	s.UpdateAccountClaims(s.LookupAccount(string(fooPub)), fooAC)
+
+	checkShadow(0)
+
+	// Now put it back as normal.
+	fooAC = jwt.NewAccountClaims(string(fooPub))
+	streamExport = &jwt.Export{Subject: "foo", Type: jwt.Stream}
+	fooAC.Exports.Add(streamExport)
+	fooJWT, err = fooAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(fooPub), fooJWT)
+	s.UpdateAccountClaims(s.LookupAccount(string(fooPub)), fooAC)
+
+	checkShadow(1)
 }

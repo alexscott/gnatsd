@@ -36,6 +36,7 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/nats-io/gnatsd/logger"
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 )
 
@@ -479,31 +480,88 @@ func (s *Server) LookupAccount(name string) *Account {
 
 	acc := s.accounts[name]
 	if acc != nil {
+		// If we are expired and we have a resolver, then
+		// return the latest information from the resolver.
+		if s.accResolver != nil && acc.IsExpired() {
+			s.UpdateAccount(acc)
+		}
 		return acc
 	}
 	// If we have a resolver see if it can fetch the account.
 	return s.FetchAccount(name)
 }
 
+// This will fetch new claims and if found update the account with new claims.
+func (s *Server) UpdateAccount(acc *Account) bool {
+	// TODO(dlc) - Make configurable
+	if time.Since(acc.updated) < time.Second {
+		s.Debugf("Requested account update for [%s] ignored, too soon", acc.Name)
+		return false
+	}
+	claimJWT, err := s.fetchRawAccountClaims(acc.Name)
+	if err != nil {
+		return false
+	}
+	acc.updated = time.Now()
+	if acc.claimJWT != "" && acc.claimJWT == claimJWT {
+		s.Debugf("Requested account update for [%s], same claims detected", acc.Name)
+		return false
+	}
+	accClaims, err := s.verifyAccountClaims(claimJWT)
+	if err == nil && accClaims != nil {
+		s.UpdateAccountClaims(acc, accClaims)
+		return true
+	}
+	return false
+}
+
+// fetchRawAccountClaims will grab raw account claims iff we have a resolver.
+func (s *Server) fetchRawAccountClaims(name string) (string, error) {
+	accResolver := s.accResolver
+	if accResolver == nil {
+		return "", ErrNoAccountResolver
+	}
+	// Need to do actual Fetch without the lock.
+	s.mu.Unlock()
+	claimJWT, err := accResolver.Fetch(name)
+	s.mu.Lock()
+	if err != nil {
+		return "", err
+	}
+	return claimJWT, nil
+}
+
+// fetchAccountClaims will attempt to fetch new claims if a resolver is present.
+func (s *Server) fetchAccountClaims(name string) (*jwt.AccountClaims, error) {
+	claimJWT, err := s.fetchRawAccountClaims(name)
+	if err != nil {
+		return nil, err
+	}
+	return s.verifyAccountClaims(claimJWT)
+}
+
+// verifyAccountClaims will decode and validate any account claims.
+func (s *Server) verifyAccountClaims(claimJWT string) (*jwt.AccountClaims, error) {
+	if accClaims, err := jwt.DecodeAccountClaims(claimJWT); err != nil {
+		return nil, err
+	} else {
+		vr := jwt.CreateValidationResults()
+		accClaims.Validate(vr)
+		if vr.IsBlocking(true) {
+			return nil, ErrAccountValidation
+		}
+		return accClaims, nil
+	}
+}
+
 // This will fetch an account from a resolver if defined.
 // Lock should be held.
 func (s *Server) FetchAccount(name string) *Account {
-	accResolver := s.accResolver
-	if accResolver == nil {
-		return nil
-	}
-
-	// Need to do actual Fetch without the lock.
-	s.mu.Unlock()
-	accClaims, err := accResolver.Fetch(name)
-	s.mu.Lock()
-
-	if err != nil {
-		return nil
-	}
-	if acc := s.buildInternalAccount(accClaims); acc != nil {
-		s.registerAccount(acc)
-		return acc
+	if accClaims, _ := s.fetchAccountClaims(name); accClaims != nil {
+		if acc := s.buildInternalAccount(accClaims); acc != nil {
+			s.registerAccount(acc)
+			return acc
+		}
 	}
 	return nil
 }

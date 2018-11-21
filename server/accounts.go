@@ -17,6 +17,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,8 @@ type Account struct {
 	Name     string
 	Nkey     string
 	Issuer   string
+	claimJWT string
+	updated  time.Time
 	mu       sync.RWMutex
 	sl       *Sublist
 	etmr     *time.Timer
@@ -58,10 +61,11 @@ type Account struct {
 
 // Import stream mapping struct
 type streamImport struct {
-	acc    *Account
-	from   string
-	prefix string
-	claim  *jwt.Import
+	acc     *Account
+	from    string
+	prefix  string
+	claim   *jwt.Import
+	invalid bool
 }
 
 // Import service mapping struct
@@ -346,7 +350,7 @@ func (a *Account) AddStreamImportWithClaim(account *Account, from, prefix string
 		prefix = prefix + string(btsep)
 	}
 	// TODO(dlc) - collisions, etc.
-	a.imports.streams[from] = &streamImport{account, from, prefix, imClaim}
+	a.imports.streams[from] = &streamImport{account, from, prefix, imClaim, false}
 	return nil
 }
 
@@ -391,7 +395,10 @@ func (a *Account) checkStreamImportAuthorized(account *Account, subject string, 
 	// Find the subject in the exports list.
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	return a.checkStreamImportAuthorizedNoLock(account, subject, imClaim)
+}
 
+func (a *Account) checkStreamImportAuthorizedNoLock(account *Account, subject string, imClaim *jwt.Import) bool {
 	if a.exports.streams == nil || !IsValidSubject(subject) {
 		return false
 	}
@@ -493,6 +500,22 @@ func (a *Account) checkStreamImportsEqual(b *Account) bool {
 	return true
 }
 
+func (a *Account) checkStreamExportsEqual(b *Account) bool {
+	if len(a.exports.streams) != len(b.exports.streams) {
+		return false
+	}
+	for subj, aea := range a.exports.streams {
+		bea, ok := b.exports.streams[subj]
+		if !ok {
+			return false
+		}
+		if !reflect.DeepEqual(aea, bea) {
+			return false
+		}
+	}
+	return true
+}
+
 // Check if another account is authorized to route requests to this service.
 func (a *Account) checkServiceImportAuthorized(account *Account, subject string, imClaim *jwt.Import) bool {
 	// Find the subject in the services list.
@@ -569,7 +592,8 @@ func (a *Account) checkExpiration(claims *jwt.ClaimsData) {
 		return
 	}
 	tn := time.Now().Unix()
-	if claims.Expires < tn {
+	if claims.Expires <= tn {
+		a.expired = true
 		return
 	}
 	expiresAt := time.Duration(claims.Expires - tn)
@@ -595,6 +619,8 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 	}
 	a.checkExpiration(ac.Claims())
 
+	// Clone to update
+	old := *a
 	// Reset exports and imports here.
 	a.exports = exportMap{}
 	a.imports = importMap{}
@@ -626,13 +652,51 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 			a.AddServiceImportWithClaim(acc, string(i.Subject), string(i.To), i)
 		}
 	}
+	// Now let's apply any needed changes from import/export changes.
+	if !a.checkStreamImportsEqual(&old) {
+		awcsti := map[string]struct{}{a.Name: struct{}{}}
+		a.mu.RLock()
+		clients := make([]*client, 0, len(a.clients))
+		for _, c := range a.clients {
+			clients = append(clients, c)
+		}
+		a.mu.RUnlock()
+		for _, c := range clients {
+			c.processSubsOnConfigReload(awcsti)
+		}
+	}
+	// Now check if exports have changed.
+	if !a.checkStreamExportsEqual(&old) {
+		clients := make([]*client, 0, 16)
+		// We need to check all accounts that have an import claim from this account.
+		awcsti := map[string]struct{}{}
+		for _, acc := range s.accounts {
+			acc.mu.Lock()
+			for _, im := range acc.imports.streams {
+				if im != nil && im.acc.Name == a.Name {
+					// Check for if we are still authorized for an import.
+					im.invalid = !a.checkStreamImportAuthorizedNoLock(im.acc, im.from, im.claim)
+					awcsti[acc.Name] = struct{}{}
+					for _, c := range acc.clients {
+						clients = append(clients, c)
+					}
+					break
+				}
+			}
+			acc.mu.Unlock()
+		}
+		// Now walk clients.
+		for _, c := range clients {
+			c.processSubsOnConfigReload(awcsti)
+		}
+	}
+
 	// FIXME(dlc) - Limits etc..
 }
 
 // Helper to build an internal account structure from a jwt.AccountClaims.
 func (s *Server) buildInternalAccount(ac *jwt.AccountClaims) *Account {
 	acc := &Account{Name: ac.Subject, Issuer: ac.Issuer}
-	acc.checkExpiration(ac.Claims())
 	s.UpdateAccountClaims(acc, ac)
 	return acc
 }
@@ -666,7 +730,7 @@ func buildInternalNkeyUser(uc *jwt.UserClaims, acc *Account) *NkeyUser {
 
 // AccountResolver interface. This is to fetch Account JWTs by public nkeys
 type AccountResolver interface {
-	Fetch(pub string) (*jwt.AccountClaims, error)
+	Fetch(pub string) (string, error)
 }
 
 // Mostly for testing.
@@ -674,18 +738,9 @@ type memAccResolver struct {
 	sync.Map
 }
 
-func (m *memAccResolver) Fetch(pub string) (*jwt.AccountClaims, error) {
+func (m *memAccResolver) Fetch(pub string) (string, error) {
 	if j, ok := m.Load(pub); ok {
-		if acc, err := jwt.DecodeAccountClaims(j.(string)); err != nil {
-			return nil, err
-		} else {
-			vr := jwt.CreateValidationResults()
-			acc.Validate(vr)
-			if vr.IsBlocking(true) {
-				return nil, ErrAccountValidation
-			}
-			return acc, nil
-		}
+		return j.(string), nil
 	}
-	return nil, ErrMissingAccount
+	return "", ErrMissingAccount
 }

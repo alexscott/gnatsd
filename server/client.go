@@ -1459,6 +1459,9 @@ func (c *client) addShadowSubscriptions(acc *Account, sub *subscription) error {
 	// and may not be an exact subset, but is a match. Therefore we have to
 	// subscribe to the import subject, not the subscription's subject.
 	for _, im := range acc.imports.streams {
+		if im.invalid {
+			continue
+		}
 		subj := string(sub.subject)
 		if subj == im.prefix+im.from {
 			ims = append(ims, im)
