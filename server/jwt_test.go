@@ -156,9 +156,8 @@ func TestJWTUserExpired(t *testing.T) {
 	nkp, _ := nkeys.CreateUser()
 	pub, _ := nkp.PublicKey()
 	nuc := jwt.NewUserClaims(string(pub))
-	claims := nuc.Claims()
-	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
-	claims.Expires = time.Now().Add(-2 * time.Second).Unix()
+	nuc.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	nuc.Expires = time.Now().Add(-2 * time.Second).Unix()
 
 	akp, _ := nkeys.FromSeed(aSeed)
 	jwt, err := nuc.Encode(akp)
@@ -193,9 +192,8 @@ func TestJWTUserExpiresAfterConnect(t *testing.T) {
 	nkp, _ := nkeys.CreateUser()
 	pub, _ := nkp.PublicKey()
 	nuc := jwt.NewUserClaims(string(pub))
-	claims := nuc.Claims()
-	claims.IssuedAt = time.Now().Unix()
-	claims.Expires = time.Now().Add(time.Second).Unix()
+	nuc.IssuedAt = time.Now().Unix()
+	nuc.Expires = time.Now().Add(time.Second).Unix()
 
 	akp, _ := nkeys.FromSeed(aSeed)
 	jwt, err := nuc.Encode(akp)
@@ -311,9 +309,8 @@ func TestJWTAccountExpired(t *testing.T) {
 	akp, _ := nkeys.CreateAccount()
 	apub, _ := akp.PublicKey()
 	nac := jwt.NewAccountClaims(string(apub))
-	claims := nac.Claims()
-	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
-	claims.Expires = time.Now().Add(-2 * time.Second).Unix()
+	nac.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	nac.Expires = time.Now().Add(-2 * time.Second).Unix()
 	ajwt, err := nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
@@ -359,9 +356,8 @@ func TestJWTAccountExpiresAfterConnect(t *testing.T) {
 	akp, _ := nkeys.CreateAccount()
 	apub, _ := akp.PublicKey()
 	nac := jwt.NewAccountClaims(string(apub))
-	claims := nac.Claims()
-	claims.IssuedAt = time.Now().Unix()
-	claims.Expires = time.Now().Add(time.Second).Unix()
+	nac.IssuedAt = time.Now().Unix()
+	nac.Expires = time.Now().Add(time.Second).Unix()
 	ajwt, err := nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
@@ -437,9 +433,8 @@ func TestJWTAccountRenew(t *testing.T) {
 	akp, _ := nkeys.CreateAccount()
 	apub, _ := akp.PublicKey()
 	nac := jwt.NewAccountClaims(string(apub))
-	claims := nac.Claims()
-	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
-	claims.Expires = time.Now().Add(-2 * time.Second).Unix()
+	nac.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	nac.Expires = time.Now().Add(-2 * time.Second).Unix()
 	ajwt, err := nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
@@ -474,10 +469,8 @@ func TestJWTAccountRenew(t *testing.T) {
 	}
 
 	// Now update with new expiration
-
-	claims = nac.Claims()
-	claims.IssuedAt = time.Now().Unix()
-	claims.Expires = time.Now().Add(5 * time.Second).Unix()
+	nac.IssuedAt = time.Now().Unix()
+	nac.Expires = time.Now().Add(5 * time.Second).Unix()
 	ajwt, err = nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
@@ -520,9 +513,8 @@ func TestJWTAccountRenewFromResolver(t *testing.T) {
 	akp, _ := nkeys.CreateAccount()
 	apub, _ := akp.PublicKey()
 	nac := jwt.NewAccountClaims(string(apub))
-	claims := nac.Claims()
-	claims.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
-	claims.Expires = time.Now().Unix()
+	nac.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	nac.Expires = time.Now().Unix()
 	ajwt, err := nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
@@ -559,9 +551,8 @@ func TestJWTAccountRenewFromResolver(t *testing.T) {
 	}
 
 	// Now update with new expiration
-	claims = nac.Claims()
-	claims.IssuedAt = time.Now().Unix()
-	claims.Expires = time.Now().Add(5 * time.Second).Unix()
+	nac.IssuedAt = time.Now().Unix()
+	nac.Expires = time.Now().Add(5 * time.Second).Unix()
 	ajwt, err = nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
@@ -856,7 +847,7 @@ func TestJWTAccountImportExportUpdates(t *testing.T) {
 		}
 	}
 
-	// We Created a SUB on foo which should create a shadow subscription.
+	// We created a SUB on foo which should create a shadow subscription.
 	checkShadow(1)
 
 	// Now update bar and remove the import which should make the shadow go away.
@@ -918,4 +909,105 @@ func TestJWTAccountImportExportUpdates(t *testing.T) {
 	s.UpdateAccountClaims(s.LookupAccount(string(fooPub)), fooAC)
 
 	checkShadow(1)
+}
+
+func TestJWTAccountImportActivationExpires(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create accounts and imports/exports.
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(string(fooPub))
+	streamExport := &jwt.Export{Subject: "foo", Type: jwt.Stream, TokenReq: true}
+	fooAC.Exports.Add(streamExport)
+
+	fooJWT, err := fooAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	addAccountToMemResolver(s, string(fooPub), fooJWT)
+
+	acc := s.LookupAccount(string(fooPub))
+	if acc == nil {
+		t.Fatalf("Expected to retrieve the account")
+	}
+
+	barKP, _ := nkeys.CreateAccount()
+	barPub, _ := barKP.PublicKey()
+	barAC := jwt.NewAccountClaims(string(barPub))
+	streamImport := &jwt.Import{Account: string(fooPub), Subject: "foo", To: "import.", Type: jwt.Stream}
+
+	activation := jwt.NewActivationClaims(string(barPub))
+	activation.Exports = jwt.Exports{}
+	activation.Exports.Add(&jwt.Export{Subject: "foo", Type: jwt.Stream})
+	activation.IssuedAt = time.Now().Add(-10 * time.Second).Unix()
+	activation.Expires = time.Now().Add(time.Second).Unix()
+	actJWT, err := activation.Encode(fooKP)
+	if err != nil {
+		t.Fatalf("Error generating activation token: %v", err)
+	}
+	streamImport.Token = actJWT
+	barAC.Imports.Add(streamImport)
+	barJWT, err := barAC.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	addAccountToMemResolver(s, string(barPub), barJWT)
+
+	// Create a client.
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(string(pub))
+	ujwt, err := nuc.Encode(barKP)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	c, cr, l := newClientForServer(s)
+
+	// Sign Nonce
+	var info nonceInfo
+	json.Unmarshal([]byte(l[5:]), &info)
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.StdEncoding.EncodeToString(sigraw)
+
+	// PING needed to flush the +OK/-ERR to us.
+	// This should fail too since no account resolver is defined.
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nSUB import.foo 1\r\nPING\r\n", ujwt, sig)
+	go c.parse([]byte(cs))
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected an OK, got: %v", l)
+	}
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "PONG\r\n") {
+		t.Fatalf("PONG response incorrect: %q\n", l)
+	}
+
+	checkShadow := func(expected int) {
+		t.Helper()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		sub := c.subs["1"]
+		if ls := len(sub.shadow); ls != expected {
+			t.Fatalf("Expected shadows to be %d, got %d", expected, ls)
+		}
+	}
+
+	// We created a SUB on foo which should create a shadow subscription.
+	checkShadow(1)
+
+	time.Sleep(2 * time.Second)
+
+	// Should have expired and been removed.
+	checkShadow(0)
 }

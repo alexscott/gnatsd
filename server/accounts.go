@@ -412,7 +412,7 @@ func (a *Account) checkStreamImportAuthorizedNoLock(account *Account, subject st
 		}
 		// Check if token required
 		if ea != nil && ea.tokenReq {
-			return a.checkActivation(imClaim)
+			return a.checkActivation(account, imClaim, true)
 		}
 		// If we have a matching account we are authorized
 		_, ok := ea.approved[account.Name]
@@ -430,7 +430,7 @@ func (a *Account) checkStreamImportAuthorizedNoLock(account *Account, subject st
 			}
 			// Check if token required
 			if ea != nil && ea.tokenReq {
-				return a.checkActivation(imClaim)
+				return a.checkActivation(account, imClaim, true)
 			}
 			_, ok := ea.approved[account.Name]
 			return ok
@@ -455,12 +455,44 @@ func fetchActivation(url string) string {
 	return string(body)
 }
 
+// Fires for expired activation tokens. We could track this with timers etc.
+// Instead we just re-analyze where we are and if we need to act.
+func (a *Account) activationExpired(subject string) {
+	a.mu.RLock()
+	if a.expired || a.imports.streams == nil {
+		a.mu.RUnlock()
+		return
+	}
+	// FIXME(dlc) - check services too?
+	si := a.imports.streams[subject]
+	a.mu.RUnlock()
+
+	if si == nil || si.invalid {
+		return
+	}
+	if si.acc.checkActivation(a, si.claim, false) {
+		// The token has been updated most likely and we are good to go.
+		return
+	}
+
+	a.mu.Lock()
+	si.invalid = true
+	clients := make([]*client, 0, len(a.clients))
+	for _, c := range a.clients {
+		clients = append(clients, c)
+	}
+	awcsti := map[string]struct{}{a.Name: struct{}{}}
+	a.mu.Unlock()
+	for _, c := range clients {
+		c.processSubsOnConfigReload(awcsti)
+	}
+}
+
 // checkActivation will check the activation token for validity.
-func (a *Account) checkActivation(claim *jwt.Import) bool {
+func (a *Account) checkActivation(acc *Account, claim *jwt.Import, expTimer bool) bool {
 	if claim == nil || claim.Token == "" {
 		return false
 	}
-
 	// Create a quick clone so we can inline Token JWT.
 	clone := *claim
 
@@ -473,9 +505,28 @@ func (a *Account) checkActivation(claim *jwt.Import) bool {
 	if vr.IsBlocking(true) {
 		return false
 	}
-	// TODO(dlc) - add expiration timer?
-	_, err := jwt.DecodeActivationClaims(clone.Token)
-	return err == nil
+	act, err := jwt.DecodeActivationClaims(clone.Token)
+	if err != nil {
+		return false
+	}
+	vr = jwt.CreateValidationResults()
+	act.Validate(vr)
+	if vr.IsBlocking(true) {
+		return false
+	}
+	if act.Expires != 0 {
+		tn := time.Now().Unix()
+		if act.Expires <= tn {
+			return false
+		}
+		if expTimer && len(act.Exports) > 0 {
+			expiresAt := time.Duration(act.Expires - tn)
+			time.AfterFunc(expiresAt*time.Second, func() {
+				acc.activationExpired(string(act.Exports[0].Subject))
+			})
+		}
+	}
+	return true
 }
 
 // Returns true if `a` and `b` stream imports are the same. Note that the
@@ -532,7 +583,7 @@ func (a *Account) checkServiceImportAuthorized(account *Account, subject string,
 	}
 
 	if ae != nil && ae.tokenReq {
-		return a.checkActivation(imClaim)
+		return a.checkActivation(account, imClaim, false)
 	}
 
 	// Check to see if we are public or if we need to search for the account.
@@ -620,7 +671,8 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 	a.checkExpiration(ac.Claims())
 
 	// Clone to update
-	old := *a
+	old := &Account{Name: a.Name, imports: a.imports, exports: a.exports}
+
 	// Reset exports and imports here.
 	a.exports = exportMap{}
 	a.imports = importMap{}
@@ -653,7 +705,7 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 		}
 	}
 	// Now let's apply any needed changes from import/export changes.
-	if !a.checkStreamImportsEqual(&old) {
+	if !a.checkStreamImportsEqual(old) {
 		awcsti := map[string]struct{}{a.Name: struct{}{}}
 		a.mu.RLock()
 		clients := make([]*client, 0, len(a.clients))
@@ -666,7 +718,7 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 		}
 	}
 	// Now check if exports have changed.
-	if !a.checkStreamExportsEqual(&old) {
+	if !a.checkStreamExportsEqual(old) {
 		clients := make([]*client, 0, 16)
 		// We need to check all accounts that have an import claim from this account.
 		awcsti := map[string]struct{}{}
